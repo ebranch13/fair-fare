@@ -1,0 +1,163 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+# Required packages
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(lubridate)
+library(scales)
+library(jsonlite)
+library(viridis)
+library(htmlwidgets)
+
+# Read and clean stations data
+stations <- read_csv("data/stations.csv") %>%
+  select(URI, name, `country-code`, longitude, latitude, avg_stop_times) %>%
+  mutate(
+    name = gsub("/.*", "", name),
+    station_id = gsub("http://irail.be/stations/NMBS/", "", URI)
+  )
+
+# Function to safely process one JSON line
+process_json_line <- function(line) {
+  tryCatch({
+    # Parse JSON string
+    data <- fromJSON(line)
+    
+    # Extract relevant fields and return as tibble
+    tibble(
+      timestamp = ymd_hms(data$querytime),
+      from_station = gsub("http://irail.be/stations/NMBS/", "", data$post$from),
+      vehicle = gsub("http://irail.be/vehicle/", "", data$post$vehicle),
+      occupancy = gsub("http://api.irail.be/terms/", "", data$post$occupancy),
+      to_station = gsub("http://irail.be/stations/NMBS/", "", data$post$to),
+      date = as.Date(data$querytime),
+      weekday = wday(ymd_hms(data$querytime), label = TRUE),
+      hour = hour(ymd_hms(data$querytime))
+    )
+  }, error = function(e) {
+    # Return NULL for any problematic lines
+    NULL
+  })
+}
+
+# Read and process occupancy data
+occupancy_lines <- readLines("data/occupancy-until-20161029.txt")
+occupancy_data <- do.call(rbind, lapply(occupancy_lines, process_json_line)) %>%
+  as_tibble() %>%
+  filter(!is.na(timestamp))
+
+# Print summary to check data
+print("Data summary:")
+print(summary(occupancy_data))
+print("Number of records:")
+print(nrow(occupancy_data))
+
+# Visualization 1: Interactive map of stations
+station_map <- leaflet(stations) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    ~longitude, 
+    ~latitude,
+    radius = ~sqrt(avg_stop_times)/2,
+    popup = ~paste(name, "<br>Avg Stops:", round(avg_stop_times, 1)),
+    color = ~colorNumeric("viridis", avg_stop_times)(avg_stop_times),
+    fillOpacity = 0.7
+  )
+
+# Visualization 2: Occupancy by time of day
+if(nrow(occupancy_data) > 0) {
+  occupancy_by_hour <- occupancy_data %>%
+    group_by(hour, occupancy) %>%
+    summarise(count = n(), .groups = 'drop')
+  
+  p1 <- ggplot(occupancy_by_hour, aes(x = hour, y = count, fill = occupancy)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_fill_viridis_d() +
+    theme_minimal() +
+    labs(
+      title = "Train Occupancy Distribution by Hour",
+      x = "Hour of Day",
+      y = "Proportion",
+      fill = "Occupancy Level"
+    )
+  
+  # Visualization 3: Occupancy by weekday
+  occupancy_by_weekday <- occupancy_data %>%
+    group_by(weekday, occupancy) %>%
+    summarise(count = n(), .groups = 'drop')
+  
+  p2 <- ggplot(occupancy_by_weekday, aes(x = weekday, y = count, fill = occupancy)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_fill_viridis_d() +
+    theme_minimal() +
+    labs(
+      title = "Train Occupancy Distribution by Day of Week",
+      x = "Day of Week",
+      y = "Proportion",
+      fill = "Occupancy Level"
+    )
+  
+  # Visualization 4: Popular routes
+  top_routes <- occupancy_data %>%
+    filter(!is.na(to_station)) %>%
+    count(from_station, to_station, sort = TRUE) %>%
+    left_join(stations %>% select(station_id, name), 
+              by = c("from_station" = "station_id")) %>%
+    left_join(stations %>% select(station_id, name), 
+              by = c("to_station" = "station_id"), 
+              suffix = c("_from", "_to")) %>%
+    head(20)
+  
+  p3 <- ggplot(top_routes, aes(x = reorder(name_from, n), 
+                              y = reorder(name_to, n), 
+                              fill = n)) +
+    geom_tile() +
+    scale_fill_viridis() +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      title = "Most Frequent Train Routes",
+      x = "From Station",
+      y = "To Station",
+      fill = "Number of Trips"
+    )
+  
+  # Visualization 5: Daily occupancy patterns
+  daily_occupancy <- occupancy_data %>%
+    group_by(date, occupancy) %>%
+    summarise(count = n(), .groups = 'drop')
+  
+  p4 <- ggplot(daily_occupancy, aes(x = date, y = count, fill = occupancy)) +
+    geom_area(position = "stack") +
+    scale_fill_viridis_d() +
+    theme_minimal() +
+    labs(
+      title = "Daily Train Occupancy Patterns",
+      x = "Date",
+      y = "Number of Trips",
+      fill = "Occupancy Level"
+    )
+  
+  # Save visualizations
+ ggsave("outputs/occupancy_by_hour.png", p1, width = 10, height = 6)
+ggsave("outputs/occupancy_by_weekday.png", p2, width = 10, height = 6)
+ggsave("outputs/top_routes.png", p3, width = 12, height = 8)
+ggsave("outputs/daily_occupancy.png", p4, width = 12, height = 6)
+
+# Save interactive map
+htmlwidgets::saveWidget(station_map, "outputs/station_map.html")
+
+p1
+p2
+p3
+p4
+station_map
+}
+```
+
