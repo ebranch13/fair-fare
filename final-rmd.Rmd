@@ -1,0 +1,183 @@
+---
+title: "PPA-final"
+author: "Emily Branch"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(tigris)
+library(tidycensus)
+library(viridis)
+library(riem)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(RSocrata)
+
+```
+```{r}
+# Read and clean stations data
+stations <- read_csv("data/stations.csv") %>%
+  select(URI, name, `country-code`, longitude, latitude, avg_stop_times) %>%
+  mutate(
+    name = gsub("/.*", "", name),
+    station_id = gsub("http://irail.be/stations/NMBS/", "", URI)
+  )
+
+# Function to safely process one JSON line
+process_json_line <- function(line) {
+  tryCatch({
+    # Parse JSON string
+    data <- fromJSON(line)
+    
+    # Extract relevant fields and return as tibble
+    tibble(
+      timestamp = ymd_hms(data$querytime),
+      from_station = gsub("http://irail.be/stations/NMBS/", "", data$post$from),
+      vehicle = gsub("http://irail.be/vehicle/", "", data$post$vehicle),
+      occupancy = gsub("http://api.irail.be/terms/", "", data$post$occupancy),
+      to_station = gsub("http://irail.be/stations/NMBS/", "", data$post$to),
+      date = as.Date(data$querytime),
+      weekday = wday(ymd_hms(data$querytime), label = TRUE),
+      hour = hour(ymd_hms(data$querytime))
+    )
+  }, error = function(e) {
+    # Return NULL for any problematic lines
+    NULL
+  })
+}
+
+# Read and process occupancy data
+occupancy_lines <- readLines("data/occupancy-until-20161029.txt")
+occupancy_data <- do.call(rbind, lapply(occupancy_lines, process_json_line)) %>%
+  as_tibble() %>%
+  filter(!is.na(timestamp))
+```
+```{r}
+occup_stations <- left_join(occupancy_data, stations, by = c("from_station" = "station_id")) %>%
+  rename("lat_from" = latitude,
+         "lon_from" = longitude,
+         "avg_stop_from" = avg_stop_times,
+         "name_from" = name)
+
+occup_stations <- left_join(occup_stations, select(stations, "station_id", "latitude", "longitude", "avg_stop_times", "name"), by = c("to_station" = "station_id")) %>%
+  rename("lat_to" = latitude,
+         "lon_to" = longitude,
+         "avg_stop_to" = avg_stop_times,
+         "name_to" = name)
+```
+
+
+```{r time_bins }
+occupancy_bin <- occup_stations %>%
+  mutate(interval60 = floor_date(ymd_hms(timestamp), unit = "hour"),
+         interval15 = floor_date(ymd_hms(timestamp), unit = "15 mins"),
+         week = week(interval60),
+         dotw = wday(interval60, label=TRUE))
+
+glimpse(occupancy_bin)
+```
+```{r panel_length_check , message = FALSE, warning = FALSE}
+length(unique(occupancy_bin$interval60)) * length(unique(occupancy_bin$from_station))
+
+
+study.panel <- 
+  expand.grid(interval60=unique(occupancy_bin$interval60), 
+              from_station = unique(occupancy_bin$from_station)) %>%
+  left_join(., occupancy_bin %>%
+              select(from_station, lon_from, lat_from )%>%
+              distinct() %>%
+              group_by(from_station) %>%
+              slice(1))
+
+nrow(study.panel)      
+```
+
+```{r create_panel , message = FALSE}
+ride.panel <- 
+  occupancy_bin %>%
+  mutate(Trip_Counter = 1) %>%
+  right_join(study.panel) %>% 
+  group_by(interval60, from_station, lon_from, lat_from) %>%
+  summarize(Trip_Count = sum(Trip_Counter, na.rm=T)) %>%
+  #left_join(weather.Panel) %>%
+  ungroup() %>%
+  filter(is.na(from_station) == FALSE) %>%
+  mutate(week = week(interval60),
+         dotw = wday(interval60, label = TRUE))
+```
+
+```{r}
+ride.panel <- 
+  ride.panel %>% 
+  arrange(from_station, interval60) %>% 
+  mutate(lagHour = dplyr::lag(Trip_Count,1),
+         lag2Hours = dplyr::lag(Trip_Count,2),
+         lag3Hours = dplyr::lag(Trip_Count,3),
+         lag4Hours = dplyr::lag(Trip_Count,4),
+         lag12Hours = dplyr::lag(Trip_Count,12),
+         lag1day = dplyr::lag(Trip_Count,24)#,
+         #holiday = ifelse(yday(interval60) == 148,1,0)
+         ) %>%
+   mutate(day = yday(interval60))# %>%
+   #mutate(holidayLag = case_when(dplyr::lag(holiday, 1) == 1 ~ "PlusOneDay",
+                                # dplyr::lag(holiday, 2) == 1 ~ "PlustTwoDays",
+                                # dplyr::lag(holiday, 3) == 1 ~ "PlustThreeDays",
+                                 #dplyr::lead(holiday, 1) == 1 ~ "MinusOneDay",
+                                 #dplyr::lead(holiday, 2) == 1 ~ "MinusTwoDays",
+                                 #dplyr::lead(holiday, 3) == 1 ~ "MinusThreeDays"),
+         #holidayLag = ifelse(is.na(holidayLag) == TRUE, 0, holidayLag))
+```
+
+
+```{r evaluate_lags , warning = FALSE, message = FALSE}
+as.data.frame(ride.panel) %>%
+    group_by(interval60) %>% 
+    summarise_at(vars(starts_with("lag"), "Trip_Count"), mean, na.rm = TRUE) %>%
+    gather(Variable, Value, -interval60, -Trip_Count) %>%
+    mutate(Variable = factor(Variable, levels=c("lagHour","lag2Hours","lag3Hours","lag4Hours",
+                                                "lag12Hours","lag1day")))%>%
+    group_by(Variable) %>%  
+    summarize(correlation = round(cor(Value, Trip_Count),2))
+```
+
+```{r train_test }
+ride.Train <- filter(ride.panel, week >= 38)
+ride.Test <- filter(ride.panel, week < 38)
+```
+
+```{r}
+reg5 <- 
+  lm(Trip_Count ~  from_station + hour(interval60) + lagHour,
+     data=ride.Train)
+```
+```{r nest_data , warning = FALSE, message = FALSE}
+ride.Test.weekNest <- 
+  ride.Test %>%
+  nest(-week) 
+```
+```{r predict_function }
+model_pred <- function(occupancy_data, reg5){
+   pred <- predict(fit, newdata = occupancy_data)}
+```
+
+
+```{r do_predicitons }
+week_predictions <- 
+  ride.Test.weekNest %>% 
+    mutate(basic_m = map(.x = data, fit = reg5, .f = model_pred)) %>% 
+    gather(Regression, Prediction, -data, -week) %>%
+    mutate(Observed = map(data, pull, Trip_Count),
+           Absolute_Error = map2(Observed, Prediction,  ~ abs(.x - .y)),
+           MAE = map_dbl(Absolute_Error, mean, na.rm = TRUE),
+           sd_AE = map_dbl(Absolute_Error, sd, na.rm = TRUE))
+week_predictions
+```
