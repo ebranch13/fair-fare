@@ -163,7 +163,40 @@ stations <- read.csv("data/stations.csv") %>%
   mutate(
     name = gsub("/.*", "", name),
     station_id = gsub("http://irail.be/stations/NMBS/", "", URI)
+  ) %>%
+  filter(country.code == "be") %>%
+  dplyr::select(-URI, -country.code)
+
+lines <- read.csv("data/line_info.csv")
+
+# Transform the dataframe
+station_lines <- lines %>%
+  separate_rows(stopping_station_ids, sep = ",") %>%
+  rename(station_id = stopping_station_ids) %>%
+  mutate(
+    station_id = str_replace_all(station_id, "'", ""),
+    station_id = str_replace_all(station_id, "\\]", ""),
+    station_id = str_replace_all(station_id, "\\[", ""),
+    station_id = str_replace_all(station_id, " ", "")
+  ) %>%
+  group_by(station_id) %>%
+  summarise(
+    lines = paste(unique(X), collapse = ", "),  # Ensure no duplicates in lines before concatenating
+    .groups = "drop"
+  ) %>%
+  mutate(
+    lines = str_replace_all(lines, " ", ""),
+    lines = str_split(lines, ",")
   )
+  
+
+
+stations <- left_join(stations, station_lines)
+
+
+```
+
+```{r}
 
 stations_sf <- st_as_sf(stations, coords= c("longitude", "latitude"))
 st_crs(stations_sf) <- crs(munis)
@@ -182,10 +215,10 @@ if (any(!invalid_geometries)) {
 }
 
 
-bounds <- st_union(allvars_munis)
-bounds <- st_make_valid(bounds)
-st_crs(bounds) <- crs(stations_sf)
-be_stations <- st_intersection(stations_sf, bounds)
+#bounds <- st_union(allvars_munis)
+#bounds <- st_make_valid(bounds)
+#st_crs(bounds) <- crs(stations_sf)
+be_stations <- stations_sf
 
 invalid_geometries <- st_is_valid(allvars_munis)
 if (any(!invalid_geometries)) {
@@ -196,7 +229,7 @@ if (any(!invalid_geometries)) {
 
 liteVars_munis <- allvars_munis %>% dplyr::select(CODE_INS, geometry, MS_MEDIAN, MS_MEDIAN_imputed, pop_dens, pop_dens_quintile, Area_km)
 
-stations_munis <- st_join(be_stations, liteVars_munis)
+stations_munis <- st_join(be_stations, liteVars_munis) %>% distinct()
 
 ggplot() + geom_sf(data = liteVars_munis, color = "gray")+ geom_sf(data = stations_munis, aes(color = MS_MEDIAN_imputed, size = pop_dens_quintile), alpha = 0.5) + theme_void() + scale_color_binned(name = "Median Income") + ggtitle("Belgian Train Stations by Municipal Population Density and Median Income") + scale_size_discrete(name = "Population Density Quintile")
 
@@ -218,13 +251,44 @@ occupancy_data <- occupancy_data %>%
     ),
    week = week(timestamp)
   )
-# create simple primary key for trips
-occupancy_data$trip_id <- 1:nrow(occupancy_data) 
 
-stations_munis <- mutate(stations_munis, "muni" = CODE_INS)
+occupancy_data$trip_id <- 1:nrow(occupancy_data)
 
-trips_to_station <- inner_join(stations_munis, occupancy_data, by = c("station_id" = "to_station"))
-trips_from_station <- inner_join(stations_munis, occupancy_data, by = c("station_id" ="from_station")) # 30 more trips here... there could be some trips going to outside of belgium
+# Join to get the lines for to_station and from_station
+occupancy_data <- occupancy_data %>%
+  left_join(station_lines, by = c("to_station" = "station_id")) %>%
+  rename(to_station_lines = lines) %>%
+  left_join(station_lines, by = c("from_station" = "station_id")) %>%
+  rename(from_station_lines = lines) %>%
+  # Find the intersection of lines
+  mutate(
+    trip_lines = map2(to_station_lines, from_station_lines, ~ intersect(.x, .y))  # Find common lines
+  )
+
+occupancy_data <- occupancy_data_with_lines %>%
+  mutate(
+    trip_lines = map(trip_lines, ~ unique(.x)),       # Remove duplicates
+    trip_lines = map(trip_lines, ~ sort(.x)),         # Sort line numbers
+    first_trip_line = map_chr(trip_lines, ~ if (length(.x) > 0) .x[1] else NA_character_) # Extract first line or 
+  ) %>%
+  dplyr::select(-to_station_lines, -from_station_lines) %>%
+  left_join(dplyr::select(lines, vehicle_id, vehicle_type), by = c("vehicle" = "vehicle_id"))
+
+
+
+```
+
+
+
+```{r}
+
+stations_munis <- mutate(stations_munis, "muni" = CODE_INS) %>%
+  distinct()
+
+
+# Join the unique trips data with stations
+trips_to_station <- left_join(stations_munis, occupancy_data, by = c("station_id" = "to_station")) %>% distinct() %>% filter(!is.na(trip_id))
+trips_from_station <- left_join(stations_munis, occupancy_data, by = c("station_id" = "from_station")) %>% distinct() %>% filter(!is.na(trip_id)) # 30 more trips here... there could be some trips going to outside of belgium
 
 
 # lets make a to/from station muni category
@@ -256,7 +320,6 @@ weights <- nb2listw(knn, style = "W")
 trips_to_station$spatial_lag <- lag.listw(weights, trips_to_station$occupancy_num)
 ```
 ```{r}
-# time lag-
 trips_to_station <- trips_to_station %>%
   arrange(hour)
 
@@ -268,15 +331,107 @@ trips_to_station <- trips_to_station %>%
          occupancy_lag168 = lag(occupancy, 168) # 1 week lag
          
          )  
+
+trips_to_station <- trips_to_station %>%
+  arrange(first_trip_line, hour) %>%  # Ensure data is sorted by train_line and time
+  group_by(first_trip_line) %>%       # Group by train_line
+  mutate(
+    time_line_lag1 = lag(occupancy, 1),   # 1 hour lag
+    time_line_lag2 = lag(occupancy, 2),   # 2 hour lag
+    time_line_lag24 = lag(occupancy, 24), # 1 day lag
+    time_line_lag168 = lag(occupancy, 168) # 1 week lag
+  ) %>%
+  ungroup()  # Ungroup after the operation
+
+
 ```
 
 ```{r}
 # weather
 
-weather <- read.csv("./data/merged_weather_stations.csv")
+weather <- st_read("./data/weather_data_with_city_coordinates.geojson") %>%
+  st_drop_geometry() %>%
+  dplyr::select(-station_id) 
+
+  weather$time <- as.character(str_pad(weather$time, width = 4, pad = "0"))  # Pad to 4 digits
+
+
+weather_sf <- st_as_sf(weather, coords= c("city_long", "city_lat"), crs = crs(stations_sf)) %>%
+  mutate( geo_f = as.factor(geometry))
+
+trips_to_station <- trips_to_station %>%
+  mutate(rounded_timestamp = round_date(timestamp, "3 hours")) %>%
+  st_as_sf()
+
+weather_stations <- st_join(
+  trips_to_station,
+  weather_sf,
+  join = st_nearest_feature
+)
+
+weather_stations$weather_timestamp <- as.POSIXct(
+  paste(weather_stations$date.y, sub("(\\d{2})(\\d{2})", "\\1:\\2", weather_stations$time)),
+  format = "%Y-%m-%d %H:%M"
+)
+
+result <- weather_stations %>%
+  filter(rounded_timestamp == weather_timestamp) 
+
+
 
 ```
 
+```{r}
+#github weather
+all_weather <- do.call(rbind, lapply(list.files("data/weather", pattern = "\\.csv$", full.names = TRUE), read.csv)) %>%
+  mutate(date_time = as.POSIXct(
+  date_time, format = "%Y-%m-%d %H:%M")
+  ) %>%
+  unique() %>%
+  dplyr::select(-lat, -lng, -X)
+
+trips_to_station <- trips_to_station %>%
+  mutate(rounded_timestamp = round_date(timestamp, "3 hours")) %>%
+  st_as_sf() %>%
+  filter(!is.na(trip_id))
+  
+
+
+final_varlist_to <- left_join(st_drop_geometry(trips_to_station), all_weather, by = c("name.from" = "station_name", "rounded_timestamp" = "date_time")) 
+#%>% left_join(., dplyr::select(trips_to_station, geometry, trip_id))
+
+
+# Impute numeric variables (temperature, windspeed, humidity, visibility)
+final_varlist_to <- final_varlist_to %>%
+  group_by(station_id) %>%
+  mutate(
+    # Temperature - Impute using previous and next values, if missing
+    temperature = ifelse(is.na(temperature), zoo::na.approx(temperature, rule = 2), temperature),
+    
+    # Windspeed - Same method for imputation
+    windspeed = ifelse(is.na(windspeed), zoo::na.approx(windspeed, rule = 2), windspeed),
+    
+    # Humidity - Same method for imputation
+    humidity = ifelse(is.na(humidity), zoo::na.approx(humidity, rule = 2), humidity),
+    
+    # Visibility - Same method for imputation
+    visibility = ifelse(is.na(visibility), zoo::na.approx(visibility, rule = 2), visibility)
+  ) %>%
+  ungroup()
+
+# Impute categorical variable (weather_type)
+final_varlist_to <- final_varlist_to %>%
+  group_by(station_id) %>%
+  mutate(
+    # For categorical variables, take the most frequent (mode) from the previous and next
+    weather_type = ifelse(is.na(weather_type), 
+                          zoo::na.locf(weather_type, fromLast = TRUE),  # Impute using last valid observation
+                          weather_type)
+  ) %>%
+  ungroup()
+
+
+```
 
 ```{r}
 # testing ordinal!!
@@ -298,17 +453,38 @@ print(brant_test) # nope not good... moving on to good ol multinom logit
 library(nnet)
 # station_id here is the to_station
 
+model_data <- st_drop_geometry(final_varlist_to)
 
-data.Train <- filter(trips_to_station, week >= 38)
-data.Test <- filter(trips_to_station, week < 38)
-data.Train <- na.omit(data.Train)
+data.Train <- filter(model_data, week >= 38)
+data.Test <- filter(model_data, week < 38)
+
 
 data.Train$occupancy_num <- factor(data.Train$occupancy_num, levels = c(1, 2, 3))
 
 
 
 
-fit_multinom <- multinom(occupancy_num ~ weekday_f +date + week + hour_f + avg_stop_times.from + avg_stop_times.to + pop_dens.to + pop_dens_quintile.to + MS_MEDIAN_imputed.to + pop_dens.from + pop_dens_quintile.from + MS_MEDIAN_imputed.from + rush_type +name.to + spatial_lag + occupancy_lag1 + occupancy_lag2 + occupancy_lag24 + occupancy_lag168, data = data.Train)
+fit_multinom <- multinom(occupancy_num ~ weekday_f +date + week + temperature + weather_type + humidity+ time_line_lag1 + time_line_lag2 + vehicle_type + Area_km + hour_f + avg_stop_times.from + avg_stop_times.to + pop_dens.to  + MS_MEDIAN_imputed.to + pop_dens.from  + MS_MEDIAN_imputed.from + rush_type +name.to + spatial_lag + occupancy_lag1 + occupancy_lag2, data = data.Train)
+
+fit_multinom <- multinom(occupancy_num ~ hour_f + date + humidity + vehicle_type + weekday_f + MS_MEDIAN_imputed.to + temperature + occupancy_lag1+ MS_MEDIAN_imputed.from +pop_dens.from + pop_dens.to + spatial_lag, data = data.Train)
+
+fit_multinom <- multinom(occupancy_num ~ timestamp + name.to+ muni.from + muni.to, data = data.Train)
+# best so far...
+fit_multinom <- multinom(occupancy_num ~ weekday_f +date + week + temperature + humidity+ time_line_lag1 + time_line_lag2  + hour_f + pop_dens.to  + MS_MEDIAN_imputed.to + pop_dens.from  + MS_MEDIAN_imputed.from  +name.to + spatial_lag + occupancy_lag1 + occupancy_lag2, data = data.Train)
+
+library(randomForest)
+
+rf_test <- dplyr::select(data.Train, -occupancy, -trip_id, -station_id, -from_station, -rounded_timestamp, -lines, -trip_lines, -occupancy_lag168, -time_line_lag168)
+
+# Train a random forest
+rf_model <- randomForest(occupancy_num ~ ., data = rf_test, importance = TRUE)
+
+# View feature importance
+importance(rf_model)
+varImpPlot(rf_model)
+
+
+
 
 # add distance?
 
@@ -319,8 +495,8 @@ fit_multinom <- multinom(occupancy_num ~ weekday_f +date + week + hour_f + avg_s
 library(caret)
 library(MLmetrics)
 
-data.Train <- data.Train %>%
-  mutate(predicted_probs = predict(fit_multinom, newdata = ., type = "probs"))
+#data.Train <- data.Train %>%
+  #mutate(predicted_probs = predict(fit_multinom, newdata = ., type = "probs"))
 
 data.Train <- data.Train %>%
   mutate(predicted_class = predict(fit_multinom, newdata = ., type = "class"))
