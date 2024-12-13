@@ -68,6 +68,13 @@ station_map <- leaflet(stations) %>%
     popup = ~paste(name, "<br>Avg Stops:", round(avg_stop_times, 1)),
     color = ~colorNumeric("viridis", avg_stop_times)(avg_stop_times),
     fillOpacity = 0.7
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = colorNumeric("viridis", domain = stations$avg_stop_times),
+    values = ~avg_stop_times,
+    title = "Avg Stop Times",
+    opacity = 0.7
   )
 
 # Visualization 2: Occupancy by time of day

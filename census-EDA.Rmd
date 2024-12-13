@@ -1,0 +1,193 @@
+---
+title: "Belgium Open Data EDA"
+output: html_notebook
+---
+
+
+```{r}
+library(dplyr)
+library(sf)
+library(ggplot2)
+library(raster)
+library(FNN)
+library(ggpubr)
+#library(BelgiumMaps.StatBel)
+
+```
+
+```{r}
+#munis_10 <- st_read("data/Belgium_shapefile/be_10km.shp")
+#munis_1 <- st_read("data/Belgium_shapefile/be_1km.shp")
+
+munis <- st_read("data/munis.geoJSON")
+munis <- mutate(munis, CODE_INS = as.numeric(CODE_INS))
+income <- read.csv("data/TF_SOC_ADI_MUNTY.csv")
+```
+```{r}
+# med income
+inc2016 <- filter(income, CD_YEAR == 2016)
+inc22 <- filter(income, CD_YEAR == 2022)
+munis_inc22 <- left_join(munis, inc22, by = c("CODE_INS" = "CD_MUNTY_REFNIS"))
+munis_inc16 <- left_join(munis, inc2016, by = c("CODE_INS" = "CD_MUNTY_REFNIS")) 
+
+
+```
+
+```{r}
+#impute missing
+centroids <- st_centroid(munis_inc16)
+coords <- st_coordinates(centroids)
+na_indices <- which(is.na(munis_inc16$MS_MEDIAN))
+knn_result <- get.knn(coords, k = 5)
+
+munis_inc16$MS_MEDIAN_imputed <- munis_inc16$MS_MEDIAN  # Create a new column for imputed values
+
+for (i in na_indices) {
+  neighbors <- knn_result$nn.index[i, ]
+  valid_neighbors <- neighbors[!is.na(munis_inc16$MS_MEDIAN[neighbors])]
+  if (length(valid_neighbors) > 0) {
+    munis_inc16$MS_MEDIAN_imputed[i] <- mean(munis_inc16$MS_MEDIAN[valid_neighbors], na.rm = TRUE)
+  }
+}
+
+```
+
+```{r}
+
+p16 <- ggplot() + geom_sf(data = munis_inc16, aes(fill = MS_MEDIAN), color = NA) + ggtitle("Reported") + theme_void()+ scale_fill_continuous(name= "Median Income", breaks = c(10000, 20000, 30000), labels = c("10k", "20k", "30k"))
+p22 <- ggplot() + geom_sf(data = munis_inc16, aes(fill = MS_MEDIAN_imputed),color=NA) + ggtitle("NAs Imputed by 5 NN Avg") + theme_void() + scale_fill_continuous(name= "Median Income", breaks = c(10000, 20000, 30000), labels = c("10k", "20k", "30k"))
+
+ptot <- ggarrange(p16, p22, ncol = 2, common.legend = TRUE, legend = "left")
+annotate_figure(ptot, top = text_grob("2016 Median Income in Belgium", 
+                                      color = "black", face = "bold", size = 18))
+
+```
+```{r}
+# population
+pop <- read.csv("data/TF_SOC_POP_STRUCT_2021.csv")
+# could potentially do smethign w age as 43% of belgians 18-24 use transit 3x/week, but maybe later
+pop_muni <- pop %>%
+  group_by(CD_REFNIS) %>%
+  summarize(population = sum(MS_POPULATION))
+
+munis_pop <- left_join(munis, pop_muni, by = c("CODE_INS" = "CD_REFNIS"))# %>%
+ # select(CODE_INS, population, geometry)
+
+# impute:
+
+na_indices_pop <- which(is.na(munis_pop$population))
+
+
+munis_pop$population_imputed <- munis_pop$population  # Create a new column for imputed values
+
+for (i in na_indices_pop) {
+  neighbors <- knn_result$nn.index[i, ]
+  valid_neighbors <- neighbors[!is.na(munis_pop$population[neighbors])]
+  if (length(valid_neighbors) > 0) {
+    munis_pop$population_imputed[i] <- mean(munis_pop$population[valid_neighbors], na.rm = TRUE)
+  }
+}
+
+# pop density
+
+
+munis_pop$Area_km <- st_area(munis_pop) /1000
+munis_pop$pop_dens <- munis_pop$population_imputed/ as.numeric(munis_pop$Area_km) 
+munis_pop$pop_dens_quintile <- as.factor(ntile(munis_pop$pop_dens, 5))
+
+g1 <- ggplot() + geom_sf(data = munis_pop, aes(fill = pop_dens), color = NA) + scale_fill_continuous(name = "People/ Km")+ theme_void() + ggtitle("Raw")
+
+g2 <- ggplot() + geom_sf(data = munis_pop, aes(fill = pop_dens_quintile), color = NA) + scale_fill_discrete(name = "Population Density Quintile") +theme_void() + ggtitle("Quintile")
+
+ptot2 <- ggarrange(g1, g2, nrow = 2)
+annotate_figure(ptot2, top = text_grob("2021 Population Density by Municipalities in Belgium", 
+                                      color = "black", face = "bold", size = 18))
+
+
+```
+```{r}
+# now let's join to stations:
+
+stations <- read.csv("data/stations.csv") %>%
+  dplyr::select(URI, name, country.code, longitude, latitude, avg_stop_times) %>%
+  mutate(
+    name = gsub("/.*", "", name),
+    station_id = gsub("http://irail.be/stations/NMBS/", "", URI)
+  )
+
+stations_sf <- st_as_sf(stations, coords= c("longitude", "latitude"))
+st_crs(stations_sf) <- crs(munis)
+
+allvars_munis <- left_join(st_drop_geometry(munis_inc16), dplyr::select(st_drop_geometry(munis_pop), pop_dens, pop_dens_quintile, Area_km, CODE_INS))
+
+allvars_munis <- left_join(dplyr::select(munis_inc16, geometry, CODE_INS), allvars_munis)
+
+
+
+```
+```{r}
+# Check for invalid geometries in allvars_munis
+invalid_geometries <- st_is_valid(allvars_munis)
+if (any(!invalid_geometries)) {
+    # Print invalid geometries if needed for inspection
+    print(allvars_munis[!invalid_geometries, ])
+    # Fix invalid geometries
+    allvars_munis <- st_make_valid(allvars_munis)
+}
+
+
+bounds <- st_union(allvars_munis)
+bounds <- st_make_valid(bounds)
+st_crs(bounds) <- crs(stations_sf)
+be_stations <- st_intersection(stations_sf, bounds)
+```
+
+
+```{r}
+
+# Check for invalid geometries in allvars_munis
+invalid_geometries <- st_is_valid(allvars_munis)
+if (any(!invalid_geometries)) {
+    # Fix invalid geometries
+    allvars_munis <- st_make_valid(allvars_munis)
+}
+
+stopBuffer <- st_buffer(be_stations, 2640)
+
+stopUnion <- st_union(st_buffer(be_stations, 2640)) # 0.5 miles in ft because thats the unit of the CRS (use st_crs() to check)
+
+stopUnion <- st_make_valid(stopUnion)
+
+stationBuffers <- 
+  rbind(
+     stopBuffer %>%
+      mutate(Legend = "Buffer") %>%
+      dplyr::select(Legend),
+     stopUnion %>%
+      st_sf() %>%
+      mutate(Legend = "Unioned Buffer"))
+
+buffer <- filter(stationBuffers, Legend=="Unioned Buffer")
+
+
+selectCentroids <- # these are munis with stations in them... i dont need this LOL
+  st_centroid(allvars_munis)[buffer,] %>%
+  st_drop_geometry() %>%
+  left_join(., dplyr::select(allvars_munis, CODE_INS), by = "CODE_INS") %>%
+  st_sf()
+
+```
+```{r}
+# what i actually want is for each station to be associated with a municipality... so a spatial join LOL
+
+liteVars_munis <- allvars_munis %>% dplyr::select(CODE_INS, geometry, MS_MEDIAN, MS_MEDIAN_imputed, pop_dens, pop_dens_quintile, Area_km)
+
+stations_munis <- st_join(be_stations, liteVars_munis)
+
+ggplot() + geom_sf(data = liteVars_munis, color = "gray")+ geom_sf(data = stations_munis, aes(color = MS_MEDIAN_imputed, size = pop_dens_quintile), alpha = 0.5) + theme_void() + scale_color_binned(name = "Median Income") + ggtitle("Belgian Train Stations by Municipal Population Density and Median Income") + scale_size_discrete(name = "Population Density Quintile") 
+#+ geom_sf(data = be_stations, color = "darkblue", size = 0.25, alpha = 0.25) 
+
+```
+
+
+

@@ -1,0 +1,335 @@
+---
+title: "Multinomial Logt"
+output: html_notebook
+---
+
+```{r}
+# setup
+
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(lubridate)
+library(scales)
+library(jsonlite)
+library(viridis)
+library(htmlwidgets)
+library(ggplot2)
+library(raster)
+library(FNN)
+library(ggpubr)
+```
+
+```{r}
+# occupancy read-in
+# Function to safely process one JSON line
+process_json_line <- function(line) {
+  tryCatch({
+    # Parse JSON string
+    data <- fromJSON(line)
+    
+    # Extract relevant fields and return as tibble
+    tibble(
+      timestamp = ymd_hms(data$querytime),
+      from_station = gsub("http://irail.be/stations/NMBS/", "", data$post$from),
+      vehicle = gsub("http://irail.be/vehicle/", "", data$post$vehicle),
+      occupancy = gsub("http://api.irail.be/terms/", "", data$post$occupancy),
+      to_station = gsub("http://irail.be/stations/NMBS/", "", data$post$to),
+      date = as.Date(data$querytime),
+      weekday = wday(ymd_hms(data$querytime), label = TRUE),
+      hour = hour(ymd_hms(data$querytime))
+    )
+  }, error = function(e) {
+    # Return NULL for any problematic lines
+    NULL
+  })
+}
+
+occupancy_lines <- readLines("data/occupancy-until-20161029.txt")
+occupancy_data <- do.call(rbind, lapply(occupancy_lines, process_json_line)) %>%
+  as_tibble() %>%
+  filter(!is.na(timestamp))
+```
+
+```{r}
+# occupancy EDA:
+
+trips_by_hour <- occupancy_data %>%
+     group_by(hour) %>%
+     summarise(count = n(), .groups = 'drop')
+ggplot() + geom_area(data = trips_by_hour, aes(x = hour, y =count)) + theme_minimal()
+
+# so based on this we are seeing about 5 distinct time groups-
+# peaks- morning rush = 4 -8
+# lunch rush = 9 - 13
+# evenng rush = 14- 18
+# dead hours =  20 -3
+occupancy_data <- occupancy_data %>%
+  mutate(rush_type = case_when(
+    hour >= 4 & hour <= 8 ~ "morning rush",
+    hour >= 9 & hour <= 13 ~ "lunch rush",
+    hour >= 14 & hour <= 19 ~ "evening rush",
+    hour >= 20 | hour <= 3 ~ "dead hours",
+    TRUE ~ "non-rush"
+  ))
+```
+
+
+```{r}
+# belgium open data
+
+munis <- st_read("data/munis.geoJSON")
+munis <- mutate(munis, CODE_INS = as.numeric(CODE_INS))
+income <- read.csv("data/TF_SOC_ADI_MUNTY.csv")
+
+inc2016 <- filter(income, CD_YEAR == 2016)
+munis_inc16 <- left_join(munis, inc2016, by = c("CODE_INS" = "CD_MUNTY_REFNIS")) 
+
+#impute missing
+centroids <- st_centroid(munis_inc16)
+coords <- st_coordinates(centroids)
+na_indices <- which(is.na(munis_inc16$MS_MEDIAN))
+knn_result <- get.knn(coords, k = 5)
+
+munis_inc16$MS_MEDIAN_imputed <- munis_inc16$MS_MEDIAN  # Create a new column for imputed values
+
+for (i in na_indices) {
+  neighbors <- knn_result$nn.index[i, ]
+  valid_neighbors <- neighbors[!is.na(munis_inc16$MS_MEDIAN[neighbors])]
+  if (length(valid_neighbors) > 0) {
+    munis_inc16$MS_MEDIAN_imputed[i] <- mean(munis_inc16$MS_MEDIAN[valid_neighbors], na.rm = TRUE)
+  }
+}
+
+
+p16 <- ggplot() + geom_sf(data = munis_inc16, aes(fill = MS_MEDIAN), color = NA) + ggtitle("Reported") + theme_void()+ scale_fill_continuous(name= "Median Income", breaks = c(10000, 20000, 30000), labels = c("10k", "20k", "30k"))
+p22 <- ggplot() + geom_sf(data = munis_inc16, aes(fill = MS_MEDIAN_imputed),color=NA) + ggtitle("NAs Imputed by 5 NN Avg") + theme_void() + scale_fill_continuous(name= "Median Income", breaks = c(10000, 20000, 30000), labels = c("10k", "20k", "30k"))
+
+ptot <- ggarrange(p16, p22, ncol = 2, common.legend = TRUE, legend = "bottom")
+annotate_figure(ptot, top = text_grob("2016 Median Income in Belgium", 
+                                      color = "black", face = "bold", size = 18))
+
+```
+
+```{r}
+# population
+pop <- read.csv("data/TF_SOC_POP_STRUCT_2021.csv")
+# could potentially do smethign w age as 43% of belgians 18-24 use transit 3x/week, but maybe later
+pop_muni <- pop %>%
+  group_by(CD_REFNIS) %>%
+  summarize(population = sum(MS_POPULATION))
+
+munis_pop <- left_join(munis, pop_muni, by = c("CODE_INS" = "CD_REFNIS"))# %>%
+ # select(CODE_INS, population, geometry)
+
+# impute:
+
+na_indices_pop <- which(is.na(munis_pop$population))
+
+
+munis_pop$population_imputed <- munis_pop$population  # Create a new column for imputed values
+
+for (i in na_indices_pop) {
+  neighbors <- knn_result$nn.index[i, ]
+  valid_neighbors <- neighbors[!is.na(munis_pop$population[neighbors])]
+  if (length(valid_neighbors) > 0) {
+    munis_pop$population_imputed[i] <- mean(munis_pop$population[valid_neighbors], na.rm = TRUE)
+  }
+}
+
+# pop density
+
+
+munis_pop$Area_km <- st_area(munis_pop) /1000
+munis_pop$pop_dens <- munis_pop$population_imputed/ as.numeric(munis_pop$Area_km) 
+munis_pop$pop_dens_quintile <- as.factor(ntile(munis_pop$pop_dens, 5))
+
+g1 <- ggplot() + geom_sf(data = munis_pop, aes(fill = pop_dens), color = NA) + scale_fill_continuous(name = "People/ Km")+ theme_void() + ggtitle("Raw")
+
+g2 <- ggplot() + geom_sf(data = munis_pop, aes(fill = pop_dens_quintile), color = NA) + scale_fill_discrete(name = "Population Density Quintile") +theme_void() + ggtitle("Quintile")
+
+ptot2 <- ggarrange(g1, g2, nrow = 2)
+annotate_figure(ptot2, top = text_grob("2021 Population Density by Municipalities in Belgium", 
+                                      color = "black", face = "bold", size = 18))
+
+
+```
+
+
+```{r}
+# station data-
+stations <- read.csv("data/stations.csv") %>%
+  dplyr::select(URI, name, country.code, longitude, latitude, avg_stop_times) %>%
+  mutate(
+    name = gsub("/.*", "", name),
+    station_id = gsub("http://irail.be/stations/NMBS/", "", URI)
+  )
+
+stations_sf <- st_as_sf(stations, coords= c("longitude", "latitude"))
+st_crs(stations_sf) <- crs(munis)
+
+allvars_munis <- left_join(st_drop_geometry(munis_inc16), dplyr::select(st_drop_geometry(munis_pop), pop_dens, pop_dens_quintile, Area_km, CODE_INS))
+
+allvars_munis <- left_join(dplyr::select(munis_inc16, geometry, CODE_INS), allvars_munis)
+
+# Check for invalid geometries in allvars_munis
+invalid_geometries <- st_is_valid(allvars_munis)
+if (any(!invalid_geometries)) {
+    # Print invalid geometries if needed for inspection
+    print(allvars_munis[!invalid_geometries, ])
+    # Fix invalid geometries
+    allvars_munis <- st_make_valid(allvars_munis)
+}
+
+
+bounds <- st_union(allvars_munis)
+bounds <- st_make_valid(bounds)
+st_crs(bounds) <- crs(stations_sf)
+be_stations <- st_intersection(stations_sf, bounds)
+
+invalid_geometries <- st_is_valid(allvars_munis)
+if (any(!invalid_geometries)) {
+    # Fix invalid geometries
+    allvars_munis <- st_make_valid(allvars_munis)
+}
+
+
+liteVars_munis <- allvars_munis %>% dplyr::select(CODE_INS, geometry, MS_MEDIAN, MS_MEDIAN_imputed, pop_dens, pop_dens_quintile, Area_km)
+
+stations_munis <- st_join(be_stations, liteVars_munis)
+
+ggplot() + geom_sf(data = liteVars_munis, color = "gray")+ geom_sf(data = stations_munis, aes(color = MS_MEDIAN_imputed, size = pop_dens_quintile), alpha = 0.5) + theme_void() + scale_color_binned(name = "Median Income") + ggtitle("Belgian Train Stations by Municipal Population Density and Median Income") + scale_size_discrete(name = "Population Density Quintile")
+
+```
+
+```{r}
+# made 2 versions for visualizing purposes, but both dfs should have the same vars?
+
+occupancy_data <- occupancy_data %>%
+  mutate(
+    weekday_f = as.factor(weekday),
+    hour_f = as.factor(hour),
+    from_station = as.character(from_station),
+    to_station = as.character(to_station), 
+    occupancy_num = case_when(
+      occupancy == "high" ~ 3,
+      occupancy == "medium" ~ 2,
+      occupancy == "low" ~ 1
+    ),
+   week = week(timestamp)
+  )
+# create simple primary key for trips
+occupancy_data$trip_id <- 1:nrow(occupancy_data) 
+
+stations_munis <- mutate(stations_munis, "muni" = CODE_INS)
+
+trips_to_station <- inner_join(stations_munis, occupancy_data, by = c("station_id" = "to_station"))
+trips_from_station <- inner_join(stations_munis, occupancy_data, by = c("station_id" ="from_station")) # 30 more trips here... there could be some trips going to outside of belgium
+
+
+# lets make a to/from station muni category
+
+trips_to_station <- left_join(st_drop_geometry(trips_to_station), dplyr::select(st_drop_geometry(trips_from_station), muni, name, trip_id, pop_dens, pop_dens_quintile, MS_MEDIAN_imputed, avg_stop_times), by= ("trip_id" = "trip_id"), suffix = c(".to", ".from"))
+
+trips_to_station <- left_join(trips_to_station, dplyr::select(stations_munis, geometry, station_id), by = c("station_id" = "station_id"))
+
+trips_from_station <- left_join(st_drop_geometry(trips_from_station), dplyr::select(st_drop_geometry(trips_to_station), muni.to, trip_id, name.to, pop_dens.to, pop_dens_quintile.to, MS_MEDIAN_imputed.to, avg_stop_times.to), by= ("trip_id" = "trip_id"))
+
+trips_from_station <- left_join(trips_from_station, dplyr::select(stations_munis, geometry, station_id), by = c("station_id" = "station_id"))
+
+#trips_from_station <- rename(trips_from_station, muni.from = muni)
+```
+
+
+```{r}
+# spatial weights
+trips_to_station <- st_as_sf(trips_to_station)
+
+library(spdep)
+
+# Compute k-nearest neighbors
+coords <- st_coordinates(st_centroid(trips_to_station))
+knn <- knn2nb(knearneigh(coords, k = 3))  # 3 nearest neighbors
+
+# Convert to weights
+weights <- nb2listw(knn, style = "W")
+trips_to_station$spatial_lag <- lag.listw(weights, trips_to_station$occupancy_num)
+```
+```{r}
+# time lag-
+trips_to_station <- trips_to_station %>%
+  arrange(hour)
+
+trips_to_station <- trips_to_station %>%
+  mutate(occupancy_lag1 = lag(occupancy, 1), # 1 hour lag
+         occupancy_lag2 = lag(occupancy, 2),
+         occupancy_lag24 = lag(occupancy, 24), # 1 day lag
+         occupancy_lag1 = lag(occupancy, 1),
+         occupancy_lag168 = lag(occupancy, 168) # 1 week lag
+         
+         )  
+```
+
+```{r}
+# weather
+
+weather <- read.csv("./data/merged_weather_stations.csv")
+
+```
+
+
+```{r}
+# testing ordinal!!
+library(MASS)
+library(brant)
+
+# Fit ordinal logistic regression
+model_ordinal <- polr(as.ordered(occupancy_num) ~ weekday +date + avg_stop_times + pop_dens + MS_MEDIAN_imputed, data = trips_to_station, method = "logistic")
+
+# Test proportional odds assumption
+brant_test <- brant(model_ordinal)
+print(brant_test) # nope not good... moving on to good ol multinom logit
+
+```
+
+```{r}
+# multinom logit
+
+library(nnet)
+# station_id here is the to_station
+
+
+data.Train <- filter(trips_to_station, week >= 38)
+data.Test <- filter(trips_to_station, week < 38)
+data.Train <- na.omit(data.Train)
+
+data.Train$occupancy_num <- factor(data.Train$occupancy_num, levels = c(1, 2, 3))
+
+
+
+
+fit_multinom <- multinom(occupancy_num ~ weekday_f +date + week + hour_f + avg_stop_times.from + avg_stop_times.to + pop_dens.to + pop_dens_quintile.to + MS_MEDIAN_imputed.to + pop_dens.from + pop_dens_quintile.from + MS_MEDIAN_imputed.from + rush_type +name.to + spatial_lag + occupancy_lag1 + occupancy_lag2 + occupancy_lag24 + occupancy_lag168, data = data.Train)
+
+# add distance?
+
+# Summarize the model
+#summary(to_multinom)
+```
+```{r}
+library(caret)
+library(MLmetrics)
+
+data.Train <- data.Train %>%
+  mutate(predicted_probs = predict(fit_multinom, newdata = ., type = "probs"))
+
+data.Train <- data.Train %>%
+  mutate(predicted_class = predict(fit_multinom, newdata = ., type = "class"))
+
+levels(data.Train$predicted_class) <- levels(data.Train$occupancy_num)
+levels(data.Train$occupancy_num) <- levels(data.Train$predicted_class)
+
+data.Train$predicted_class <- factor(data.Train$predicted_class, levels = c(1, 2, 3))
+data.Train$occupancy_num <- factor(data.Train$occupancy_num, levels = c(1, 2, 3))
+confusionMatrix(data.Train$predicted_class, data.Train$occupancy_num)
+```
+

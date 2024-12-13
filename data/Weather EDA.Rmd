@@ -1,0 +1,825 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+library(httr)
+library(xml2)
+library(dplyr)
+
+fetch_weather <- function(api_key, city, start_date, end_date = NULL, interval = 3) {
+  # Base URL
+  base_url <- "https://api.worldweatheronline.com/premium/v1/past-weather.ashx"
+  
+  # Construct query parameters
+  params <- list(
+    key = api_key,
+    q = city,
+    date = start_date,
+    enddate = if (!is.null(end_date)) end_date else start_date,
+    tp = interval,
+    format = "xml"  # Ensure response is in XML
+  )
+  
+  # Make GET request
+  response <- GET(base_url, query = params)
+  
+  # Check for successful response
+  if (status_code(response) == 200) {
+    # Parse XML content
+    xml_data <- read_xml(content(response, "text", encoding = "UTF-8"))
+    
+    # Extract relevant weather data
+    weather_data <- xml_data %>%
+      xml_find_all("//hourly") %>%
+      map_df(~ data.frame(
+        city = city,
+        date = xml_text(xml_find_first(.x, "../date")),
+        time = xml_text(xml_find_first(.x, "time")),
+        tempC = as.numeric(xml_text(xml_find_first(.x, "tempC"))),
+        precipMM = as.numeric(xml_text(xml_find_first(.x, "precipMM"))),
+        windspeedKmph = as.numeric(xml_text(xml_find_first(.x, "windspeedKmph"))),
+        humidity = as.numeric(xml_text(xml_find_first(.x, "humidity"))),
+        cloudcover = as.numeric(xml_text(xml_find_first(.x, "cloudcover"))),
+        weatherDesc = xml_text(xml_find_first(.x, "weatherDesc"))
+      ))
+    return(weather_data)
+  } else {
+    warning(paste("API request failed for city:", city, "with status code:", status_code(response)))
+    return(NULL)
+  }
+}
+
+# Define API Key
+api_key <- "0c48810babdb4a7cb08211834240512"
+
+# List of cities
+cities <- c("Brussels, Belgium", "Antwerp, Belgium", "Ghent, Belgium")
+
+# Start and end dates
+start_date <- "2017-08-01"
+end_date <- "2017-08-31"
+
+# Fetch weather data for all cities
+all_weather_data <- bind_rows(
+  lapply(cities, function(city) {
+    fetch_weather(api_key, city, start_date, end_date, interval = 3)
+  })
+)
+
+# Check the combined data
+print(head(all_weather_data))
+
+
+```
+
+```{r}
+# View the first few rows of the data
+print(head(all_weather_data))
+
+# Check structure and summary
+str(all_weather_data)
+summary(all_weather_data)
+
+# Check for missing values
+colSums(is.na(all_weather_data))
+```
+
+
+```{r}
+# Remove rows with missing data
+cleaned_weather_data <- all_weather_data %>%
+  filter(!is.na(tempC), !is.na(precipMM), !is.na(windspeedKmph), !is.na(humidity), !is.na(cloudcover))
+
+# Check for outliers in numeric variables
+boxplot(cleaned_weather_data$tempC, main = "Temperature (C)", horizontal = TRUE)
+boxplot(cleaned_weather_data$precipMM, main = "Precipitation (mm)", horizontal = TRUE)
+
+# Cap extreme outliers if necessary (example for precipitation)
+cleaned_weather_data <- cleaned_weather_data %>%
+  mutate(precipMM = ifelse(precipMM > quantile(precipMM, 0.99), quantile(precipMM, 0.99), precipMM))
+
+```
+
+```{r}
+cleaned_weather_data <- cleaned_weather_data %>%
+  mutate(
+    temp_category = case_when(
+      tempC < 10 ~ "Cold",
+      tempC >= 10 & tempC < 20 ~ "Moderate",
+      tempC >= 20 ~ "Hot"
+    ),
+    temp_category = factor(temp_category, levels = c("Cold", "Moderate", "Hot"))
+  )
+
+# Check the distribution of the target variable
+table(cleaned_weather_data$temp_category)
+
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(cleaned_weather_data, aes(x = tempC)) +
+  geom_histogram(binwidth = 2, fill = "blue", alpha = 0.7) +
+  labs(title = "Temperature Distribution", x = "Temperature (°C)", y = "Frequency")
+```
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(jsonlite)
+
+
+# Load and process the occupancy data
+occupancy_lines <- readLines("~/Documents/Comm Assignment/occupancy-until-20161029 (1).txt")
+occupancy_data <- do.call(rbind, lapply(occupancy_lines, function(line) {
+  tryCatch({
+    data <- fromJSON(line)
+    tibble(
+      querytime = ymd_hms(data$querytime),
+      from_station = gsub("http://irail.be/stations/NMBS/", "", data$post$from),
+      to_station = gsub("http://irail.be/stations/NMBS/", "", data$post$to),
+      vehicle = gsub("http://irail.be/vehicle/", "", data$post$vehicle),
+      occupancy = gsub("http://api.irail.be/terms/", "", data$post$occupancy),
+      date = as.Date(data$post$date, "%Y%m%d")
+    )
+  }, error = function(e) NULL)
+})) %>% as_tibble()
+
+
+```
+
+```{r}
+all_weather_data <- all_weather_data %>%
+  mutate(date = as.Date(as.numeric(date), origin = "1970-01-01"))
+
+# Convert numeric date values to proper Date format
+occupancy_data <- occupancy_data %>%
+  mutate(date = as.Date(date, origin = "1970-01-01"))
+
+occupancy_data <- occupancy_data %>%
+  mutate(date = as.Date(date))
+
+occupancy_data <- occupancy_data %>%
+  filter(!is.na(date))
+
+merged_data <- occupancy_data %>%
+  left_join(all_weather_data, by = "date")
+
+setdiff(occupancy_data$date, all_weather_data$date)
+
+setdiff(all_weather_data$date, occupancy_data$date)
+
+merged_data <- merged_data %>%
+  mutate(
+    tempC = ifelse(is.na(tempC), mean(tempC, na.rm = TRUE), tempC),
+    precipMM = ifelse(is.na(precipMM), mean(precipMM, na.rm = TRUE), precipMM),
+    windspeedKmph = ifelse(is.na(windspeedKmph), mean(windspeedKmph, na.rm = TRUE), windspeedKmph),
+    humidity = ifelse(is.na(humidity), mean(humidity, na.rm = TRUE), humidity),
+    cloudcover = ifelse(is.na(cloudcover), mean(cloudcover, na.rm = TRUE), cloudcover)
+  )
+
+missing_dates <- setdiff(occupancy_data$date, all_weather_data$date)
+
+additional_weather_data <- lapply(missing_dates, function(date) {
+  fetch_weather(api_key, "Brussels, Belgium", start_date = date)
+}) %>% bind_rows()
+
+all_weather_data <- bind_rows(all_weather_data, additional_weather_data)
+
+merged_data <- merged_data %>%
+  mutate(
+    tempC = ifelse(is.na(tempC), mean(tempC, na.rm = TRUE), tempC),
+    precipMM = ifelse(is.na(precipMM), mean(precipMM, na.rm = TRUE), precipMM),
+    windspeedKmph = ifelse(is.na(windspeedKmph), mean(windspeedKmph, na.rm = TRUE), windspeedKmph),
+    humidity = ifelse(is.na(humidity), mean(humidity, na.rm = TRUE), humidity),
+    cloudcover = ifelse(is.na(cloudcover), mean(cloudcover, na.rm = TRUE), cloudcover)
+  )
+
+# Identify dates with missing weather data
+missing_weather_dates <- merged_data %>%
+  filter(is.na(tempC)) %>%
+  select(date) %>%
+  distinct()
+
+# Print missing dates
+print(missing_weather_dates)
+
+
+# Fetch additional weather data for missing dates
+additional_weather_data <- lapply(missing_weather_dates$date, function(date) {
+  fetch_weather(api_key, "Brussels, Belgium", start_date = date)
+}) %>% bind_rows()
+
+# Convert additional_weather_data$date to <date>
+additional_weather_data <- additional_weather_data %>%
+  mutate(date = as.Date(date, format = "%Y-%m-%d"))
+
+# Ensure all_weather_data$date is also <date>
+all_weather_data <- all_weather_data %>%
+  mutate(date = as.Date(date, origin = "1970-01-01"))
+
+
+merged_data <- merged_data %>%
+  filter(!is.na(tempC))
+
+# Combine with existing weather data
+all_weather_data <- bind_rows(all_weather_data, additional_weather_data)
+
+# Re-join the datasets
+merged_data <- occupancy_data %>%
+  left_join(all_weather_data, by = "date")
+
+
+```
+
+```{r}
+ggplot(merged_data, aes(x = tempC, fill = occupancy)) +
+  geom_histogram(binwidth = 2, position = "fill") +
+  labs(title = "Occupancy Levels by Temperature", x = "Temperature (°C)", y = "Proportion") +
+  theme_minimal()
+
+```
+
+
+```{r}
+ggplot(merged_data, aes(x = weatherDesc, fill = occupancy)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(title = "Occupancy Levels by Weather Description", x = "Weather Description", y = "Proportion") +
+  theme_minimal()
+```
+```{r}
+# Summary statistics for weather data
+summary(merged_data[, c("tempC", "precipMM", "windspeedKmph", "humidity", "cloudcover")])
+
+```
+
+```{r}
+ggplot(merged_data, aes(x = tempC)) +
+  geom_histogram(binwidth = 2, fill = "blue", alpha = 0.7) +
+  labs(title = "Temperature Distribution", x = "Temperature (°C)", y = "Frequency") +
+  theme_minimal()
+
+
+```
+
+```{r}
+ggplot(merged_data, aes(x = weatherDesc, fill = occupancy)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(title = "Occupancy Levels by Weather Description", x = "Weather Description", y = "Proportion") +
+  theme_minimal()
+
+```
+
+```{r}
+ggplot(merged_data, aes(x = tempC, fill = occupancy)) +
+  geom_histogram(binwidth = 2, position = "fill") +
+  labs(title = "Occupancy Levels by Temperature", x = "Temperature (°C)", y = "Proportion") +
+  theme_minimal()
+
+```
+
+```{r}
+ggplot(merged_data, aes(x = precipMM, fill = occupancy)) +
+  geom_histogram(binwidth = 0.5, position = "fill") +
+  labs(title = "Occupancy Levels by Rainfall", x = "Precipitation (mm)", y = "Proportion") +
+  theme_minimal()
+
+```
+
+```{r}
+library(corrplot)
+
+numeric_data <- merged_data %>%
+  select(tempC, precipMM, windspeedKmph, humidity, cloudcover) %>%
+  mutate(occupancy = as.numeric(factor(occupancy)))
+
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+corrplot(cor_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+
+```
+
+```{r}
+merged_data <- merged_data %>%
+  mutate(day_of_week = wday(querytime, label = TRUE))
+
+ggplot(merged_data, aes(x = day_of_week, fill = occupancy)) +
+  geom_bar(position = "fill") +
+  labs(title = "Daily Occupancy Patterns", x = "Day of Week", y = "Proportion") +
+  theme_minimal()
+```
+
+```{r}
+library(lubridate)
+
+merged_data <- merged_data %>%
+  mutate(
+    day_of_week = wday(date, label = TRUE),  # Day of the week
+    is_weekend = ifelse(day_of_week %in% c("Sat", "Sun"), 1, 0),  # Weekend flag
+    time_of_day = case_when(  # Categorize time of day
+      as.numeric(time) < 600 ~ "Night",
+      as.numeric(time) < 1200 ~ "Morning",
+      as.numeric(time) < 1800 ~ "Afternoon",
+      TRUE ~ "Evening"
+    )
+  )
+
+```
+
+```{r}
+merged_data <- merged_data %>%
+  mutate(
+    temp_category = case_when(
+      tempC < 10 ~ "Cold",
+      tempC >= 10 & tempC < 20 ~ "Moderate",
+      tempC >= 20 ~ "Hot"
+    ),
+    precip_category = case_when(
+      precipMM == 0 ~ "No Rain",
+      precipMM > 0 & precipMM <= 2 ~ "Light Rain",
+      precipMM > 2 ~ "Heavy Rain"
+    )
+  )
+
+```
+
+```{r}
+# Aggregate weather data to daily averages
+daily_weather <- all_weather_data %>%
+  group_by(date) %>%
+  summarise(
+    avg_tempC = mean(tempC, na.rm = TRUE),
+    avg_precipMM = mean(precipMM, na.rm = TRUE),
+    avg_windspeedKmph = mean(windspeedKmph, na.rm = TRUE),
+    avg_humidity = mean(humidity, na.rm = TRUE),
+    avg_cloudcover = mean(cloudcover, na.rm = TRUE)
+  )
+
+# Re-join with occupancy_data
+merged_data <- occupancy_data %>%
+  left_join(daily_weather, by = "date")
+
+# Check column names
+colnames(stations)
+
+merged_data <- merged_data %>%
+  left_join(stations, by = c("from_station" = "station_id"))
+
+# Perform the join
+merged_data <- merged_data %>%
+  left_join(stations, by = c("from_station" = "station_id"))
+
+# Check the structure of occupancy
+str(merged_data$occupancy)
+
+# If occupancy is a list or nested data frame, unnest it
+merged_data <- merged_data %>%
+  mutate(occupancy = as.character(occupancy)) %>%
+  mutate(occupancy_numeric = as.numeric(factor(occupancy)))
+
+# Filter rows with complete weather data
+merged_data <- merged_data %>%
+  filter(!is.na(avg_tempC), !is.na(avg_precipMM))
+
+# Alternatively, impute missing values
+merged_data <- merged_data %>%
+  mutate(
+    avg_tempC = ifelse(is.na(avg_tempC), mean(avg_tempC, na.rm = TRUE), avg_tempC),
+    avg_precipMM = ifelse(is.na(avg_precipMM), mean(avg_precipMM, na.rm = TRUE), avg_precipMM)
+  )
+
+# Prepare numeric data for correlation analysis
+numeric_data <- merged_data %>%
+  select(avg_tempC, avg_precipMM, avg_windspeedKmph, avg_humidity, avg_cloudcover) %>%
+  drop_na()
+
+# Calculate and visualize correlation matrix
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+library(corrplot)
+corrplot(cor_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+
+```
+```{r}
+
+```
+
+```{r}
+
+library(lubridate)
+
+occupancy_data <- occupancy_data %>%
+  mutate(hour = hour(querytime))
+
+occupancy_data <- occupancy_data %>%
+  mutate(
+    day_of_week = wday(date, label = TRUE, abbr = TRUE),
+    is_weekend = ifelse(day_of_week %in% c("Sat", "Sun"), 1, 0),
+    time_of_day = case_when(
+      hour < 6 ~ "Night",
+      hour < 12 ~ "Morning",
+      hour < 18 ~ "Afternoon",
+      TRUE ~ "Evening"
+    )
+  )
+
+```
+
+```{r}
+library(ggplot2)
+
+# Plot occupancy levels by day of the week
+ggplot(occupancy_data, aes(x = day_of_week, fill = occupancy)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Train Occupancy Levels by Day of the Week",
+    x = "Day of the Week",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+# Plot occupancy levels by time of day
+ggplot(occupancy_data, aes(x = time_of_day, fill = occupancy)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Train Occupancy Levels by Time of Day",
+    x = "Time of Day",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Plot occupancy levels for weekends vs. weekdays
+ggplot(occupancy_data, aes(x = as.factor(is_weekend), fill = occupancy)) +
+  geom_bar(position = "fill") +
+  scale_x_discrete(labels = c("0" = "Weekday", "1" = "Weekend")) +
+  labs(
+    title = "Train Occupancy Levels: Weekdays vs. Weekends",
+    x = "Day Type",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Plot occupancy levels by time of day, split by weekend/weekday
+ggplot(occupancy_data, aes(x = time_of_day, fill = occupancy)) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ day_of_week) +
+  labs(
+    title = "Train Occupancy by Time of Day Across Days of the Week",
+    x = "Time of Day",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+# Ensure weather data is aggregated by date
+daily_weather <- all_weather_data %>%
+  group_by(date) %>%
+  summarise(
+    avg_tempC = mean(tempC, na.rm = TRUE),
+    avg_precipMM = mean(precipMM, na.rm = TRUE),
+    avg_windspeedKmph = mean(windspeedKmph, na.rm = TRUE),
+    avg_humidity = mean(humidity, na.rm = TRUE),
+    avg_cloudcover = mean(cloudcover, na.rm = TRUE)
+  )
+
+# Join with occupancy_data
+occupancy_data <- occupancy_data %>%
+  left_join(daily_weather, by = "date")
+
+# Plot occupancy levels by cloud cover
+ggplot(occupancy_data, aes(x = avg_cloudcover, fill = occupancy)) +
+  geom_histogram(binwidth = 10, position = "fill") +
+  labs(
+    title = "Train Occupancy Levels by Cloud Cover",
+    x = "Average Cloud Cover (%)",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Plot occupancy levels by wind speed
+ggplot(occupancy_data, aes(x = avg_windspeedKmph, fill = occupancy)) +
+  geom_histogram(binwidth = 2, position = "fill") +
+  labs(
+    title = "Train Occupancy Levels by Wind Speed",
+    x = "Average Wind Speed (km/h)",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Plot occupancy levels by wind speed
+ggplot(occupancy_data, aes(x = avg_windspeedKmph, fill = occupancy)) +
+  geom_histogram(binwidth = 2, position = "fill") +
+  labs(
+    title = "Train Occupancy Levels by Wind Speed",
+    x = "Average Wind Speed (km/h)",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Plot occupancy by time of day and temperature
+ggplot(occupancy_data, aes(x = time_of_day, y = avg_tempC, fill = occupancy)) +
+  geom_boxplot() +
+  labs(
+    title = "Temperature and Train Occupancy by Time of Day",
+    x = "Time of Day",
+    y = "Average Temperature (°C)",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Ensure the necessary columns are present and non-missing
+occupancy_data_clean <- occupancy_data %>%
+  filter(!is.na(avg_tempC), !is.na(avg_precipMM), !is.na(time_of_day), !is.na(occupancy))
+
+# Create the plot
+ggplot(occupancy_data_clean, aes(x = avg_tempC, y = avg_precipMM, fill = occupancy)) +
+  geom_tile() +
+  scale_fill_viridis_d(option = "plasma") +  # Stunning color palette
+  facet_wrap(~ time_of_day, ncol = 2) +
+  labs(
+    title = "Impact of Temperature and Precipitation on Train Occupancy",
+    subtitle = "Faceted by Time of Day",
+    x = "Average Temperature (°C)",
+    y = "Average Precipitation (mm)",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "bottom"
+  )
+
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(occupancy_data_clean, aes(x = avg_tempC, fill = occupancy)) +
+  geom_histogram(binwidth = 2, position = "fill", color = "black") +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(
+    title = "Proportion of Train Occupancy Across Temperatures",
+    x = "Average Temperature (°C)",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+    axis.text = element_text(size = 10),
+    legend.position = "right"
+  )
+
+```
+
+```{r}
+ggplot(occupancy_data_clean, aes(x = avg_tempC, y = avg_precipMM, color = occupancy)) +
+  geom_point(alpha = 0.7, size = 3) +
+  scale_color_viridis_d(option = "inferno") +
+  labs(
+    title = "Occupancy Levels by Temperature and Precipitation",
+    x = "Average Temperature (°C)",
+    y = "Average Precipitation (mm)",
+    color = "Occupancy Level"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+    axis.text = element_text(size = 10),
+    legend.position = "right"
+  )
+
+```
+
+```{r}
+library(sf)
+
+# Load station data (adjust path if necessary)
+stations <- read.csv("~/Documents/Comm Assignment/stations.csv")
+
+# Convert stations to an sf object
+stations_sf <- stations %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+```
+
+```{r}
+library(ggplot2)
+
+# Plot train stations
+ggplot(data = stations_sf) +
+  geom_sf(color = "blue", size = 2) +
+  labs(
+    title = "Train Stations in Belgium",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+library(tidygeocoder)
+
+# Geocode city names to get lat/lon
+all_weather_data <- all_weather_data %>%
+  geocode(city, method = "osm", lat = "latitude", long = "longitude")
+
+library(dplyr)
+
+# Extract unique city names from the weather dataset
+unique_cities <- all_weather_data %>%
+  distinct(city) %>%
+  filter(!is.na(city))  # Remove any missing city names
+
+
+# Geocode the unique cities
+city_coordinates <- unique_cities %>%
+  geocode(city, method = "osm", lat = "latitude", long = "longitude")
+
+# View the geocoded results
+head(city_coordinates)
+
+# Merge geocoded coordinates into weather data
+all_weather_data <- all_weather_data %>%
+  left_join(city_coordinates, by = "city")
+
+# Verify updated weather data
+head(all_weather_data)
+
+library(sf)
+
+# Convert weather data to spatial object
+weather_sf <- all_weather_data %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# Convert stations data to spatial object
+stations_sf <- stations %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# Perform spatial join to assign weather data to nearest train station
+stations_weather <- st_join(stations_sf, weather_sf, join = st_nearest_feature)
+
+# Verify the resulting data
+head(stations_weather)
+
+```
+```{r}
+library(sf)
+library(ggplot2)
+
+ggplot(stations_weather) +
+  geom_sf(aes(color = tempC), size = 3) +
+  scale_color_viridis_c(option = "plasma") +
+  labs(
+    title = "Spatial Distribution of Train Stations with Temperature",
+    color = "Temperature (°C)"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+library(ggplot2)
+
+# Bar plot of occupancy levels by city
+ggplot(occupancy_data, aes(x = from_station, fill = occupancy)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Occupancy Levels Across Train Stations",
+    x = "Train Station",
+    y = "Proportion",
+    fill = "Occupancy Level"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+library(sf)
+library(dplyr)
+
+# Convert stations to spatial points
+stations_sf <- stations %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# Convert weather data to spatial points
+weather_sf <- all_weather_data %>%
+  mutate(latitude = as.numeric(latitude), longitude = as.numeric(longitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# Perform spatial join to find nearest weather observation for each station
+stations_weather_sf <- st_join(stations_sf, weather_sf, join = st_nearest_feature)
+
+```
+
+
+
+```{r}
+library(osmdata)
+
+# Fetch POI data for Belgium
+belgium_bbox <- getbb("Belgium")
+poi_data <- opq(belgium_bbox) %>%
+  add_osm_feature(key = "amenity", value = c("school", "university", "hospital")) %>%
+  osmdata_sf()
+
+# Extract points
+poi_points <- poi_data$osm_points
+
+```
+
+```{r}
+library(sf)
+
+# Convert stations data to sf object
+stations_sf <- stations %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# Convert POI data to sf object
+poi_sf <- poi_points %>%
+  st_as_sf(crs = 4326)
+
+# Filter POI data for POINT geometries
+poi_sf <- poi_sf %>%
+  filter(st_geometry_type(.) == "POINT")
+
+# Spatial join to assign nearest POI to each station
+stations_with_pois <- st_join(stations_sf, poi_sf, join = st_nearest_feature)
+
+# Add distances to nearest POI
+stations_with_pois <- stations_with_pois %>%
+  mutate(distance_to_poi = st_distance(geometry, geometry.1))
+
+
+```
+
+```{r}
+# Filter POI data for POINT geometries
+poi_sf <- poi_sf %>%
+  filter(st_geometry_type(.) == "POINT")
+
+# Verify structure
+st_geometry_type(poi_sf)
+summary(poi_sf)
+
+library(sf)
+
+# Spatial join to assign nearest POI to each station
+stations_with_pois <- st_join(stations_sf, poi_sf, join = st_nearest_feature)
+
+# Add distances to nearest POI
+stations_with_pois <- stations_with_pois %>%
+  mutate(distance_to_poi = st_distance(geometry, geometry.1))
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
