@@ -265,7 +265,7 @@ occupancy_data <- occupancy_data %>%
     trip_lines = map2(to_station_lines, from_station_lines, ~ intersect(.x, .y))  # Find common lines
   )
 
-occupancy_data <- occupancy_data_with_lines %>%
+occupancy_data <- occupancy_data %>%
   mutate(
     trip_lines = map(trip_lines, ~ unique(.x)),       # Remove duplicates
     trip_lines = map(trip_lines, ~ sort(.x)),         # Sort line numbers
@@ -337,49 +337,15 @@ trips_to_station <- trips_to_station %>%
   group_by(first_trip_line) %>%       # Group by train_line
   mutate(
     time_line_lag1 = lag(occupancy, 1),   # 1 hour lag
-    time_line_lag2 = lag(occupancy, 2),   # 2 hour lag
-    time_line_lag24 = lag(occupancy, 24), # 1 day lag
-    time_line_lag168 = lag(occupancy, 168) # 1 week lag
+    time_line_lag2 = lag(occupancy, 2)#,   # 2 hour lag
+    #time_line_lag24 = lag(occupancy, 24), # 1 day lag
+    #time_line_lag168 = lag(occupancy, 168) # 1 week lag
   ) %>%
   ungroup()  # Ungroup after the operation
 
 
 ```
 
-```{r}
-# weather
-
-weather <- st_read("./data/weather_data_with_city_coordinates.geojson") %>%
-  st_drop_geometry() %>%
-  dplyr::select(-station_id) 
-
-  weather$time <- as.character(str_pad(weather$time, width = 4, pad = "0"))  # Pad to 4 digits
-
-
-weather_sf <- st_as_sf(weather, coords= c("city_long", "city_lat"), crs = crs(stations_sf)) %>%
-  mutate( geo_f = as.factor(geometry))
-
-trips_to_station <- trips_to_station %>%
-  mutate(rounded_timestamp = round_date(timestamp, "3 hours")) %>%
-  st_as_sf()
-
-weather_stations <- st_join(
-  trips_to_station,
-  weather_sf,
-  join = st_nearest_feature
-)
-
-weather_stations$weather_timestamp <- as.POSIXct(
-  paste(weather_stations$date.y, sub("(\\d{2})(\\d{2})", "\\1:\\2", weather_stations$time)),
-  format = "%Y-%m-%d %H:%M"
-)
-
-result <- weather_stations %>%
-  filter(rounded_timestamp == weather_timestamp) 
-
-
-
-```
 
 ```{r}
 #github weather
@@ -391,7 +357,7 @@ all_weather <- do.call(rbind, lapply(list.files("data/weather", pattern = "\\.cs
   dplyr::select(-lat, -lng, -X)
 
 trips_to_station <- trips_to_station %>%
-  mutate(rounded_timestamp = round_date(timestamp, "3 hours")) %>%
+  mutate(rounded_timestamp = round_date(timestamp, "1 hour")) %>%
   st_as_sf() %>%
   filter(!is.na(trip_id))
   
@@ -433,19 +399,6 @@ final_varlist_to <- final_varlist_to %>%
 
 ```
 
-```{r}
-# testing ordinal!!
-library(MASS)
-library(brant)
-
-# Fit ordinal logistic regression
-model_ordinal <- polr(as.ordered(occupancy_num) ~ weekday +date + avg_stop_times + pop_dens + MS_MEDIAN_imputed, data = trips_to_station, method = "logistic")
-
-# Test proportional odds assumption
-brant_test <- brant(model_ordinal)
-print(brant_test) # nope not good... moving on to good ol multinom logit
-
-```
 
 ```{r}
 # multinom logit
@@ -465,8 +418,6 @@ data.Train$occupancy_num <- factor(data.Train$occupancy_num, levels = c(1, 2, 3)
 
 
 fit_multinom <- multinom(occupancy_num ~ weekday_f +date + week + temperature + weather_type + humidity+ time_line_lag1 + time_line_lag2 + vehicle_type + Area_km + hour_f + avg_stop_times.from + avg_stop_times.to + pop_dens.to  + MS_MEDIAN_imputed.to + pop_dens.from  + MS_MEDIAN_imputed.from + rush_type +name.to + spatial_lag + occupancy_lag1 + occupancy_lag2, data = data.Train)
-
-fit_multinom <- multinom(occupancy_num ~ hour_f + date + humidity + vehicle_type + weekday_f + MS_MEDIAN_imputed.to + temperature + occupancy_lag1+ MS_MEDIAN_imputed.from +pop_dens.from + pop_dens.to + spatial_lag, data = data.Train)
 
 fit_multinom <- multinom(occupancy_num ~ timestamp + name.to+ muni.from + muni.to, data = data.Train)
 # best so far...

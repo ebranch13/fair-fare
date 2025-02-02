@@ -57,7 +57,7 @@ for (i in na_indices) {
 p16 <- ggplot() + geom_sf(data = munis_inc16, aes(fill = MS_MEDIAN), color = NA) + ggtitle("Reported") + theme_void()+ scale_fill_continuous(name= "Median Income", breaks = c(10000, 20000, 30000), labels = c("10k", "20k", "30k"))
 p22 <- ggplot() + geom_sf(data = munis_inc16, aes(fill = MS_MEDIAN_imputed),color=NA) + ggtitle("NAs Imputed by 5 NN Avg") + theme_void() + scale_fill_continuous(name= "Median Income", breaks = c(10000, 20000, 30000), labels = c("10k", "20k", "30k"))
 
-ptot <- ggarrange(p16, p22, ncol = 2, common.legend = TRUE, legend = "left")
+ptot <- ggarrange(p16, p22, ncol = 2, common.legend = TRUE, legend = "bottom")
 annotate_figure(ptot, top = text_grob("2016 Median Income in Belgium", 
                                       color = "black", face = "bold", size = 18))
 
